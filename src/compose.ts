@@ -56,7 +56,12 @@ interface Built {
   namedVolumes: Set<string>;
 }
 
-function serviceLines(resource: Resource, outDir: string, known: ReadonlySet<string>): Built {
+function serviceLines(
+  resource: Resource,
+  outDir: string,
+  services: ReadonlyMap<string, Resource>,
+): Built {
+  const known = services;
   const c = resource.config;
   const name = resource.name;
   if (!SERVICE_NAME.test(name)) {
@@ -97,12 +102,14 @@ function serviceLines(resource: Resource, outDir: string, known: ReadonlySet<str
   }
 
   const env = record(c.env);
-  const envNames = Object.keys(env)
-    .filter((k) => ENV_NAME.test(k))
-    .sort();
+  // Secrets are listed by name only in service.json; Compose reads their values from the project .env.
+  const values = new Map<string, string>();
+  for (const key of strings(record(c.secrets).required)) values.set(key, `\${${key}}`);
+  for (const [key, value] of Object.entries(env)) values.set(key, String(value));
+  const envNames = [...values.keys()].filter((k) => ENV_NAME.test(k)).sort();
   if (envNames.length > 0) {
     lines.push("    environment:");
-    for (const key of envNames) lines.push(`      ${key}: ${q(String(env[key]))}`);
+    for (const key of envNames) lines.push(`      ${key}: ${q(values.get(key) ?? "")}`);
   }
 
   const volumes = Array.isArray(c.volumes) ? c.volumes : [];
@@ -146,8 +153,15 @@ function serviceLines(resource: Resource, outDir: string, known: ReadonlySet<str
 
   const dependsOn = strings(c.dependsOn).filter((d) => known.has(d));
   if (dependsOn.length > 0) {
-    lines.push("    depends_on:", ...dependsOn.map((d) => `      - ${q(d)}`));
+    lines.push("    depends_on:");
+    for (const d of dependsOn) {
+      lines.push(
+        `      ${d}:`,
+        `        condition: ${dependencyCondition(known.get(d) as Resource)}`,
+      );
+    }
   }
+  lines.push(...healthcheckLines(name, c.healthCheck));
 
   const capAdd = strings(container.capAdd);
   const capDrop = strings(container.capDrop);
@@ -166,6 +180,44 @@ function serviceLines(resource: Resource, outDir: string, known: ReadonlySet<str
     lines.push(`    shm_size: ${q(container.shmSize)}`);
   }
   return { lines, namedVolumes };
+}
+
+/** What Compose waits for before starting a dependent: a passing check, a finished one-shot job, or the start. */
+function dependencyCondition(dep: Resource): string {
+  if (hasProbeCommand(dep.config.healthCheck)) return "service_healthy";
+  if (dep.config.restart === "no") return "service_completed_successfully";
+  return "service_started";
+}
+
+function hasProbeCommand(value: unknown): boolean {
+  return strings(record(value).command).length > 0;
+}
+
+/** A Compose `healthcheck` from `healthCheck.command` (exit 0 is ready); `healthCheck: false` turns it off. */
+function healthcheckLines(name: string, value: unknown): string[] {
+  if (value === false || record(value).enabled === false) {
+    return ["    healthcheck:", "      disable: true"];
+  }
+  const h = record(value);
+  const command = strings(h.command);
+  if (command.length === 0) return [];
+  const lines = ["    healthcheck:", `      test: [${['"CMD"', ...command.map(q)].join(", ")}]`];
+  for (const key of ["interval", "timeout"] as const) {
+    if (h[key] === undefined) continue;
+    const seconds = Number(h[key]);
+    if (!Number.isFinite(seconds) || seconds <= 0) {
+      throw new ExportError(`${name}: healthCheck.${key} must be a number of seconds above 0`);
+    }
+    lines.push(`      ${key}: ${q(`${seconds}s`)}`);
+  }
+  if (h.retries !== undefined) {
+    const retries = Number(h.retries);
+    if (!Number.isInteger(retries) || retries < 1) {
+      throw new ExportError(`${name}: healthCheck.retries must be a whole number above 0`);
+    }
+    lines.push(`      retries: ${retries}`);
+  }
+  return lines;
 }
 
 function resolveFrom(base: string, rel: string): string {
@@ -191,7 +243,7 @@ export function buildCompose(outDir: string, resources: readonly Resource[]): st
       `Exported type: ${COMPOSE_TYPE} (a service.json with an image or a Dockerfile, and no command)`,
     ]);
   }
-  const known = new Set(services.map((s) => s.name));
+  const known = new Map(services.map((s) => [s.name, s] as const));
   const body: string[] = [];
   const volumes = new Set<string>();
   for (const service of services) {
