@@ -19,6 +19,11 @@ const IMAGE = /^(?:[A-Za-z0-9._/:@-]|\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-[A-Za-z0-9.
 export const COMPOSE_TYPE = "bring-your-own";
 
 const RESTART_POLICIES = new Set(["no", "on-failure", "unless-stopped", "always"]);
+const CONDITIONS = new Set([
+  "service_started",
+  "service_healthy",
+  "service_completed_successfully",
+]);
 /** `on-failure:N` with a retry limit from 1 to 100. */
 const RESTART_LIMIT = /^on-failure:([1-9][0-9]?|100)$/;
 /** A Compose duration such as 30s, 1m30s or 500ms. */
@@ -109,6 +114,21 @@ function serviceLines(
     const context = hostPath(outDir, resolveFrom(resource.path, buildContext ?? "."));
     lines.push("    build:", `      context: ${q(context)}`);
     if (dockerfile) lines.push(`      dockerfile: ${q(dockerfile)}`);
+    // buildArgs (flisk#2983): NAME to a string, which may use Compose variables such as ${NODE_VERSION:-22}.
+    const args = Object.entries(record(c.buildArgs));
+    for (const [arg, value] of args) {
+      if (!ENV_NAME.test(arg) || typeof value !== "string") {
+        throw new ExportError(
+          `${name}: buildArgs "${arg}" needs a name of letters, digits and _ and a string`,
+        );
+      }
+    }
+    if (args.length > 0) {
+      lines.push(
+        "      args:",
+        ...args.map(([arg, value]) => `        ${arg}: ${q(value as string)}`),
+      );
+    }
   }
 
   const container = record(c.container);
@@ -118,9 +138,8 @@ function serviceLines(
       throw new ExportError(`${name}: restart "${c.restart}" is not a Compose restart policy`);
     }
     lines.push(`    restart: ${q(c.restart)}`);
-  } else {
-    lines.push('    restart: "unless-stopped"');
   }
+  // No restart in service.json is written as none: Compose's default, as the project's own Compose file had it.
 
   const sidecarOf = typeof c.sidecarOf === "string" ? c.sidecarOf : undefined;
   if (sidecarOf) {
@@ -214,14 +233,35 @@ function serviceLines(
     }
   }
 
-  const dependsOn = strings(c.dependsOn).filter((d) => known.has(d));
+  // dependsOn entries are names or { name, condition } (flisk#2983); a stated condition wins over the guess.
+  const dependsOn = (Array.isArray(c.dependsOn) ? c.dependsOn : [])
+    .map((entry) =>
+      typeof entry === "string"
+        ? { name: entry, condition: undefined }
+        : { name: record(entry).name, condition: record(entry).condition },
+    )
+    .filter(
+      (d): d is { name: string; condition: unknown } =>
+        typeof d.name === "string" && known.has(d.name),
+    );
   if (dependsOn.length > 0) {
     lines.push("    depends_on:");
     for (const d of dependsOn) {
-      lines.push(
-        `      ${d}:`,
-        `        condition: ${dependencyCondition(known.get(d) as Resource)}`,
-      );
+      const dep = known.get(d.name) as Resource;
+      if (d.condition !== undefined && !CONDITIONS.has(d.condition as string)) {
+        throw new ExportError(
+          `${name}: dependsOn "${d.name}" condition is not a Compose condition`,
+          ["Use service_started, service_healthy or service_completed_successfully"],
+        );
+      }
+      // service_healthy needs a healthcheck in this file; without one Compose would refuse to start.
+      const condition =
+        d.condition === undefined
+          ? dependencyCondition(dep)
+          : d.condition === "service_healthy" && !hasProbeCommand(dep.config.healthCheck)
+            ? "service_started"
+            : (d.condition as string);
+      lines.push(`      ${d.name}:`, `        condition: ${condition}`);
     }
   }
   lines.push(...healthcheckLines(name, c.healthCheck));
