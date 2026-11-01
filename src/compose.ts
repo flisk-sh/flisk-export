@@ -58,6 +58,9 @@ function record(value: unknown): Record<string, unknown> {
     : {};
 }
 
+// biome-ignore lint/suspicious/noControlCharactersInRegex: a control character would break the generated YAML
+const CONTROL = /[\u0000-\u001f\u007f]/;
+
 function strings(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
 }
@@ -315,6 +318,22 @@ function serviceLines(
       throw new ExportError(`${name}: shmSize "${container.shmSize}" is not a Compose size`);
     }
     lines.push(`    shm_size: ${q(container.shmSize)}`);
+  }
+  // container.entrypoint / container.command (Flisk 1.4.31): exec-form lists. `$$` and `${VAR}` are written as they are,
+  // because Compose reads them again in the file written here. An empty entrypoint drops the image's ENTRYPOINT.
+  for (const key of ["entrypoint", "command"] as const) {
+    const value = container[key];
+    if (value === undefined) continue;
+    if (
+      !Array.isArray(value) ||
+      (value.length === 0 && key === "command") ||
+      !value.every((part) => typeof part === "string" && part !== "" && !CONTROL.test(part))
+    ) {
+      throw new ExportError(
+        `${name}: container.${key} ${JSON.stringify(value)} is not a list of non-empty strings without control characters`,
+      );
+    }
+    lines.push(`    ${key}: [${value.map((part) => q(part as string)).join(", ")}]`);
   }
   if (container.stopGracePeriod !== undefined) {
     const period = container.stopGracePeriod;
