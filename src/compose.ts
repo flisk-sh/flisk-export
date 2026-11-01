@@ -9,13 +9,25 @@ import { relative, sep } from "node:path";
 import type { Resource } from "./discover.js";
 import { ExportError } from "./errors.js";
 
-/** extraPorts `publish`: digits, dots, colons and `${NAME:-default}`, as flisk core accepts it (flisk#2947). */
-const PUBLISH = /^(?:[0-9.:]|\$\{[A-Za-z_][A-Za-z0-9_]*:-[0-9.:]+\})+$/;
+/** extraPorts `publish`: digits, dots, colons and `${NAME:-default}` / `${NAME-default}`, as flisk core accepts it (flisk#2947). */
+const PUBLISH = /^(?:[0-9.:]|\$\{[A-Za-z_][A-Za-z0-9_]*:?-[0-9.:]+\})+$/;
+/** An image reference, with Compose variables `${NAME}`, `${NAME:-default}` and `${NAME-default}` kept for Compose to resolve. */
+const IMAGE = /^(?:[A-Za-z0-9._/:@-]|\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-[A-Za-z0-9._/:@-]*)?\})+$/;
 
 /** The only resource type the Compose export covers: it is the one whose service.json is a Compose service. */
 export const COMPOSE_TYPE = "bring-your-own";
 
 const RESTART_POLICIES = new Set(["no", "on-failure", "unless-stopped", "always"]);
+/** `on-failure:N` with a retry limit from 1 to 100. */
+const RESTART_LIMIT = /^on-failure:([1-9][0-9]?|100)$/;
+/** A Compose duration such as 30s, 1m30s or 500ms. */
+const DURATION = /^(?:[0-9]+(?:\.[0-9]+)?(?:h|ms|us|m|s))+$/;
+/** A DNS name: letters, digits, '-', '_' and '.'. */
+const DNS_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,252}$/;
+/** An extra_hosts address: host-gateway, IPv4, or IPv6 (optionally in brackets). */
+const HOST_ADDRESS =
+  /^(?:host-gateway|[0-9]{1,3}(?:\.[0-9]{1,3}){3}|\[?[0-9A-Fa-f.]*:[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*\]?)$/;
+const ULIMIT_NAME = /^[a-z]+$/;
 const SERVICE_NAME = /^[a-z0-9][a-z0-9_.-]*$/i;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const SHM_SIZE = /^\d+(b|k|kb|m|mb|g|gb)?$/i;
@@ -86,6 +98,11 @@ function serviceLines(
   const image = typeof c.image === "string" && c.image ? c.image : undefined;
   const dockerfile = typeof c.dockerfile === "string" && c.dockerfile ? c.dockerfile : undefined;
   const buildContext = typeof c.buildContext === "string" ? c.buildContext : undefined;
+  if (image && !IMAGE.test(image)) {
+    throw new ExportError(`${name}: image "${image}" is not an image reference`, [
+      "Use letters, digits, . _ / : @ - and Compose variables ${NAME}, ${NAME:-default} or ${NAME-default}",
+    ]);
+  }
   if (image) lines.push(`    image: ${q(image)}`);
   if (dockerfile || !image) {
     const context = hostPath(outDir, resolveFrom(resource.path, buildContext ?? "."));
@@ -96,7 +113,7 @@ function serviceLines(
   const container = record(c.container);
   if (container.init !== false) lines.push("    init: true");
   if (typeof c.restart === "string") {
-    if (!RESTART_POLICIES.has(c.restart)) {
+    if (!RESTART_POLICIES.has(c.restart) && !RESTART_LIMIT.test(c.restart)) {
       throw new ExportError(`${name}: restart "${c.restart}" is not a Compose restart policy`);
     }
     lines.push(`    restart: ${q(c.restart)}`);
@@ -110,6 +127,23 @@ function serviceLines(
       throw new ExportError(`${name}: sidecarOf "${sidecarOf}" is not a bring-your-own resource`);
     }
     lines.push(`    network_mode: ${q(`service:${sidecarOf}`)}`);
+  }
+  // Every exported service is on the default network, so its aliases go there. A sidecar has no network of its own.
+  const aliases = strings(container.networkAliases);
+  for (const alias of aliases) {
+    if (!DNS_NAME.test(alias)) {
+      throw new ExportError(`${name}: network alias "${alias}" is not a DNS name`, [
+        "Use letters, digits, '-', '_' and '.'",
+      ]);
+    }
+  }
+  if (aliases.length > 0 && !sidecarOf) {
+    lines.push(
+      "    networks:",
+      "      default:",
+      "        aliases:",
+      ...aliases.map((a) => `          - ${q(a)}`),
+    );
   }
 
   const env = record(c.env);
@@ -222,6 +256,45 @@ function serviceLines(
       throw new ExportError(`${name}: shmSize "${container.shmSize}" is not a Compose size`);
     }
     lines.push(`    shm_size: ${q(container.shmSize)}`);
+  }
+  if (container.stopGracePeriod !== undefined) {
+    const period = container.stopGracePeriod;
+    if (typeof period !== "string" || !DURATION.test(period)) {
+      throw new ExportError(
+        `${name}: stopGracePeriod ${JSON.stringify(period)} is not a duration such as 30s or 1m30s`,
+      );
+    }
+    lines.push(`    stop_grace_period: ${q(period)}`);
+  }
+  const extraHosts = strings(container.extraHosts);
+  for (const host of extraHosts) {
+    const at = host.indexOf(":");
+    if (at < 1 || !DNS_NAME.test(host.slice(0, at)) || !HOST_ADDRESS.test(host.slice(at + 1))) {
+      throw new ExportError(
+        `${name}: extraHosts "${host}" is not name:address (an IP or host-gateway)`,
+      );
+    }
+  }
+  if (extraHosts.length > 0)
+    lines.push("    extra_hosts:", ...extraHosts.map((h) => `      - ${q(h)}`));
+  const ulimits = Object.entries(record(container.ulimits));
+  if (ulimits.length > 0) {
+    lines.push("    ulimits:");
+    for (const [limit, value] of ulimits) {
+      const pair = record(value);
+      if (!ULIMIT_NAME.test(limit)) {
+        throw new ExportError(`${name}: ulimit "${limit}" is not a ulimit name`);
+      }
+      if (typeof value === "number" && Number.isInteger(value)) {
+        lines.push(`      ${limit}: ${value}`);
+      } else if (Number.isInteger(pair.soft) && Number.isInteger(pair.hard)) {
+        lines.push(`      ${limit}:`, `        soft: ${pair.soft}`, `        hard: ${pair.hard}`);
+      } else {
+        throw new ExportError(
+          `${name}: ulimit "${limit}" must be a whole number or { soft, hard } whole numbers`,
+        );
+      }
+    }
   }
   const tmpfs = strings(container.tmpfs);
   if (tmpfs.length > 0) {
