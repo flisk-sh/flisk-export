@@ -54,6 +54,7 @@ function isNamedVolume(source: string): boolean {
 interface Built {
   lines: string[];
   namedVolumes: Set<string>;
+  models: Map<string, string>;
 }
 
 function serviceLines(
@@ -71,6 +72,7 @@ function serviceLines(
   }
   const lines: string[] = [`  ${name}:`];
   const namedVolumes = new Set<string>();
+  const models = new Map<string, string>();
 
   const image = typeof c.image === "string" && c.image ? c.image : undefined;
   const dockerfile = typeof c.dockerfile === "string" && c.dockerfile ? c.dockerfile : undefined;
@@ -163,6 +165,22 @@ function serviceLines(
   }
   lines.push(...healthcheckLines(name, c.healthCheck));
 
+  // Docker Model Runner: the service lists model names, the top-level `models` block says which model each is.
+  const modelRefs = (Array.isArray(c.models) ? c.models : []).map(record);
+  if (modelRefs.length > 0) {
+    lines.push("    models:");
+    for (const ref of modelRefs) {
+      if (typeof ref.name !== "string" || !ENV_NAME.test(ref.name.replace(/[-.]/g, "_"))) {
+        throw new ExportError(`${name}: a model needs a name of letters, digits, dashes and dots`);
+      }
+      if (typeof ref.model !== "string" || !ref.model) {
+        throw new ExportError(`${name}: model "${ref.name}" needs a model reference`);
+      }
+      lines.push(`      - ${q(ref.name)}`);
+      models.set(ref.name, ref.model);
+    }
+  }
+
   const capAdd = strings(container.capAdd);
   const capDrop = strings(container.capDrop);
   const securityOpt = strings(container.securityOpt);
@@ -179,7 +197,7 @@ function serviceLines(
     }
     lines.push(`    shm_size: ${q(container.shmSize)}`);
   }
-  return { lines, namedVolumes };
+  return { lines, namedVolumes, models };
 }
 
 /** What Compose waits for before starting a dependent: a passing check, a finished one-shot job, or the start. */
@@ -246,10 +264,12 @@ export function buildCompose(outDir: string, resources: readonly Resource[]): st
   const known = new Map(services.map((s) => [s.name, s] as const));
   const body: string[] = [];
   const volumes = new Set<string>();
+  const models = new Map<string, string>();
   for (const service of services) {
     const built = serviceLines(service, outDir, known);
     body.push(...built.lines, "");
     for (const v of built.namedVolumes) volumes.add(v);
+    for (const [n, m] of built.models) models.set(n, m);
   }
   const header = [
     "###############################################################################",
@@ -261,7 +281,15 @@ export function buildCompose(outDir: string, resources: readonly Resource[]): st
     "",
     "services:",
   ];
-  const tail =
-    volumes.size > 0 ? ["volumes:", ...[...volumes].sort().map((v) => `  ${v}:`), ""] : [];
+  const tail = [
+    ...(models.size > 0
+      ? [
+          "models:",
+          ...[...models].sort().flatMap(([n, m]) => [`  ${n}:`, `    model: ${q(m)}`]),
+          "",
+        ]
+      : []),
+    ...(volumes.size > 0 ? ["volumes:", ...[...volumes].sort().map((v) => `  ${v}:`), ""] : []),
+  ];
   return [...header, ...body, ...tail].join("\n").replace(/\n{3,}/g, "\n\n");
 }
