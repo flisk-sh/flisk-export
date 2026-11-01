@@ -13,7 +13,12 @@ import { ExportError } from "./errors.js";
 /** extraPorts `publish`: digits, dots, colons and `${NAME:-default}` / `${NAME-default}`, as flisk core accepts it (flisk#2947). */
 const PUBLISH = /^(?:[0-9.:]|\$\{[A-Za-z_][A-Za-z0-9_]*:?-[0-9.:]+\})+$/;
 /** An image reference, with Compose variables `${NAME}`, `${NAME:-default}` and `${NAME-default}` kept for Compose to resolve. */
-const IMAGE = /^(?:[A-Za-z0-9._/:@-]|\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-[A-Za-z0-9._/:@-]*)?\})+$/;
+const IMAGE =
+  /^(?:[A-Za-z0-9._/:@-]|\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-[A-Za-z0-9._/:@-]+|:?\?[A-Za-z0-9 !#%&()*+,./:;<=>?@[\]^_|~-]*)?\})+$/;
+/** A bind source from the environment, `${NAME:-./path}` (flisk 1.4.28): NAME, the operator and the default path. */
+const ENV_BIND = /^\$\{([A-Za-z_][A-Za-z0-9_]*)(:?-)(\.{1,2}(?:\/[A-Za-z0-9_.-]+)*\/?)\}$/;
+const LOG_DRIVER = /^[a-z0-9][a-z0-9_.-]*$/;
+const LOG_OPTION = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 
 /** The only resource type the Compose export covers: it is the one whose service.json is a Compose service. */
 export const COMPOSE_TYPE = "bring-your-own";
@@ -186,7 +191,14 @@ function serviceLines(
         throw new ExportError(`${name}: a volume needs a source and a target`);
       }
       let source = v.source;
-      if (isNamedVolume(source)) {
+      const fromEnv = source.match(ENV_BIND);
+      if (v.selinux !== undefined && v.selinux !== "z" && v.selinux !== "Z") {
+        throw new ExportError(`${name}: volume selinux must be z or Z`);
+      }
+      if (fromEnv) {
+        // The default is relative to the service directory; Compose reads it relative to this file.
+        source = `\${${fromEnv[1]}${fromEnv[2]}${hostPath(outDir, resolveFrom(resource.path, fromEnv[3] as string))}}`;
+      } else if (isNamedVolume(source)) {
         const dockerName = typeof v.name === "string" ? v.name : undefined;
         if (dockerName !== undefined && !DOCKER_NAME.test(dockerName)) {
           throw new ExportError(`${name}: volume name "${dockerName}" is not a Docker volume name`);
@@ -195,7 +207,13 @@ function serviceLines(
       } else {
         source = hostPath(outDir, resolveFrom(resource.path, source));
       }
-      lines.push(`      - ${q(`${source}:${v.target}${v.readOnly === true ? ":ro" : ""}`)}`);
+      const options = [
+        ...(v.readOnly === true ? ["ro"] : []),
+        ...(typeof v.selinux === "string" ? [v.selinux] : []),
+      ];
+      lines.push(
+        `      - ${q(`${source}:${v.target}${options.length ? `:${options.join(",")}` : ""}`)}`,
+      );
     }
   }
 
@@ -373,6 +391,36 @@ function serviceLines(
         "        required: false",
       );
     }
+  }
+  // logging (flisk 1.4.28): a driver and string options, checked so nothing can add a key.
+  if (c.logging !== undefined) {
+    const logging = record(c.logging);
+    const options = Object.entries(record(logging.options));
+    if (
+      logging.driver !== undefined &&
+      (typeof logging.driver !== "string" || !LOG_DRIVER.test(logging.driver))
+    ) {
+      throw new ExportError(
+        `${name}: logging.driver "${String(logging.driver)}" is not a logging driver`,
+      );
+    }
+    for (const [key, value] of options) {
+      if (!LOG_OPTION.test(key) || typeof value !== "string") {
+        throw new ExportError(
+          `${name}: logging option "${key}" needs a name of letters, digits, _ . - and a string`,
+        );
+      }
+    }
+    lines.push(
+      "    logging:",
+      ...(typeof logging.driver === "string" ? [`      driver: ${q(logging.driver)}`] : []),
+      ...(options.length
+        ? [
+            "      options:",
+            ...options.map(([key, value]) => `        ${key}: ${q(value as string)}`),
+          ]
+        : []),
+    );
   }
   const profiles = strings(c.profiles);
   if (profiles.length > 0) {
