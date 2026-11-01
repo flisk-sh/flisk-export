@@ -45,8 +45,9 @@ flisk-export compose --check    # exit 1 when that file is out of date (for CI)
 ```
 
 Writes a **standalone** `docker-compose.yml` from the bring-your-own `service.json` files (`image` or `dockerfile`, `env`,
-`volumes`, `extraPorts`, `dependsOn`, `sidecarOf`, `container`). It runs with plain `docker compose up` and no Flisk: no external
-networks, no `FLISK_*` variables, no generated secrets. `${VAR}` references in `env` pass through for Compose to read from `.env`.
+`secrets.required`, `volumes`, `extraPorts`, `dependsOn`, `healthCheck`, `sidecarOf`, `container`). It runs with plain `docker compose up` and no Flisk: no external
+networks, no `FLISK_*` variables, no generated secrets. `${VAR}` references in `env`, and every name in `secrets.required`, pass through as `${NAME}` for Compose to read from `.env`.
+`healthCheck.command` becomes a Compose `healthcheck`; a service that lists a checked service in `dependsOn` waits for `service_healthy`, and one that lists a `restart: "no"` job waits for `service_completed_successfully`.
 Other resource types and `command` (native) services are not exported. The file is generated: change `service.json` and run it
 again with `--force`. It never starts a container or calls an API.
 
