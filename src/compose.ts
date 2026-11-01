@@ -350,7 +350,9 @@ function dependencyCondition(dep: Resource): string {
   return "service_started";
 }
 
+/** Whether the output has a healthcheck for this value: a command, and not turned off. Only then can a dependent wait for service_healthy. */
 function hasProbeCommand(value: unknown): boolean {
+  if (value === false || record(value).enabled === false) return false;
   return strings(record(value).command).length > 0;
 }
 
@@ -363,13 +365,17 @@ function healthcheckLines(name: string, value: unknown): string[] {
   const command = strings(h.command);
   if (command.length === 0) return [];
   const lines = ["    healthcheck:", `      test: [${['"CMD"', ...command.map(q)].join(", ")}]`];
-  for (const key of ["interval", "timeout"] as const) {
+  for (const [key, composeKey] of [
+    ["interval", "interval"],
+    ["timeout", "timeout"],
+    ["startPeriod", "start_period"],
+  ] as const) {
     if (h[key] === undefined) continue;
     const seconds = Number(h[key]);
     if (!Number.isFinite(seconds) || seconds <= 0) {
       throw new ExportError(`${name}: healthCheck.${key} must be a number of seconds above 0`);
     }
-    lines.push(`      ${key}: ${q(`${seconds}s`)}`);
+    lines.push(`      ${composeKey}: ${q(`${seconds}s`)}`);
   }
   if (h.retries !== undefined) {
     const retries = Number(h.retries);
