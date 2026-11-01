@@ -19,6 +19,10 @@ const RESTART_POLICIES = new Set(["no", "on-failure", "unless-stopped", "always"
 const SERVICE_NAME = /^[a-z0-9][a-z0-9_.-]*$/i;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const SHM_SIZE = /^\d+(b|k|kb|m|mb|g|gb)?$/i;
+const TMPFS = /^\/[A-Za-z0-9_./-]*(:[a-z0-9=,_-]+)?$/;
+const CPUS = /^[0-9]+(\.[0-9]{1,2})?$/;
+const MEMORY = /^[0-9]+([bBkKmMgG][bB]?)?$/;
+const PROFILE = /^[a-z0-9][a-z0-9-]*$/;
 const DOCKER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 
 export function isComposeExportable(resource: Resource): boolean {
@@ -218,6 +222,50 @@ function serviceLines(
       throw new ExportError(`${name}: shmSize "${container.shmSize}" is not a Compose size`);
     }
     lines.push(`    shm_size: ${q(container.shmSize)}`);
+  }
+  const tmpfs = strings(container.tmpfs);
+  if (tmpfs.length > 0) {
+    for (const t of tmpfs) {
+      if (!TMPFS.test(t))
+        throw new ExportError(`${name}: tmpfs "${t}" is not /path or /path:options`);
+    }
+    lines.push("    tmpfs:", ...tmpfs.map((t) => `      - ${q(t)}`));
+  }
+  const cpus = container.cpus === undefined ? undefined : String(container.cpus);
+  const memory = typeof container.memory === "string" ? container.memory : undefined;
+  if (cpus !== undefined && !CPUS.test(cpus))
+    throw new ExportError(`${name}: cpus "${cpus}" is not a number of CPUs`);
+  if (memory !== undefined && !MEMORY.test(memory))
+    throw new ExportError(`${name}: memory "${memory}" is not a size such as 2g`);
+  if (cpus !== undefined || memory !== undefined) {
+    lines.push(
+      "    deploy:",
+      "      resources:",
+      "        limits:",
+      ...(cpus !== undefined ? [`          cpus: ${q(cpus)}`] : []),
+      ...(memory !== undefined ? [`          memory: ${q(memory)}`] : []),
+    );
+  }
+  // Paths in envFile are relative to the service directory; a missing file is skipped, as Flisk does.
+  const envFiles = strings(c.envFile);
+  if (envFiles.length > 0) {
+    lines.push("    env_file:");
+    for (const file of envFiles) {
+      if (!/^[A-Za-z0-9_.-]+(\/[A-Za-z0-9_.-]+)*$/.test(file)) {
+        throw new ExportError(`${name}: envFile "${file}" is not a relative path`);
+      }
+      lines.push(
+        `      - path: ${q(hostPath(outDir, resolveFrom(resource.path, file)))}`,
+        "        required: false",
+      );
+    }
+  }
+  const profiles = strings(c.profiles);
+  if (profiles.length > 0) {
+    for (const p of profiles) {
+      if (!PROFILE.test(p)) throw new ExportError(`${name}: profile "${p}" is not a profile name`);
+    }
+    lines.push("    profiles:", ...profiles.map((p) => `      - ${q(p)}`));
   }
   return { lines, namedVolumes, models };
 }

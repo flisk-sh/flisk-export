@@ -1,6 +1,6 @@
 {
   "name": "@flisk-sh/flisk-export",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "Write a Render Blueprint (render.yaml), a Cloudflare wrangler.toml or a standalone docker-compose.yml from Flisk service.json files. Never deploys.",
   "type": "module",
   "license": "MIT",
