@@ -9,6 +9,9 @@ import { relative, sep } from "node:path";
 import type { Resource } from "./discover.js";
 import { ExportError } from "./errors.js";
 
+/** extraPorts `publish`: digits, dots, colons and `${NAME:-default}`, as flisk core accepts it (flisk#2947). */
+const PUBLISH = /^(?:[0-9.:]|\$\{[A-Za-z_][A-Za-z0-9_]*:-[0-9.:]+\})+$/;
+
 /** The only resource type the Compose export covers: it is the one whose service.json is a Compose service. */
 export const COMPOSE_TYPE = "bring-your-own";
 
@@ -152,9 +155,22 @@ function serviceLines(
       if (!Number.isInteger(port) || port < 1 || port > 65535) {
         throw new ExportError(`${name}: extraPorts needs a port from 1 to 65535`);
       }
-      const hostPort = p.hostPort === undefined ? port : Number(p.hostPort);
-      const bind = typeof p.bind === "string" && p.bind ? p.bind : "127.0.0.1";
       const protocol = p.protocol === "udp" ? "udp" : "tcp";
+      // `publish` (flisk#2947): the host side as the project's Compose wrote it, e.g. "${APP_HTTP_BIND:-80}"; Compose resolves it.
+      if (p.publish !== undefined) {
+        if (typeof p.publish !== "string" || !PUBLISH.test(p.publish)) {
+          throw new ExportError(
+            `${name}: extraPorts publish must be a port, an IPv4 address:port, or \${NAME:-default}`,
+          );
+        }
+        lines.push(`      - ${q(`${p.publish}:${port}/${protocol}`)}`);
+        continue;
+      }
+      const hostPort = p.hostPort === undefined ? port : Number(p.hostPort);
+      const bind = p.bind === undefined ? "127.0.0.1" : p.bind;
+      if (bind !== "127.0.0.1" && bind !== "0.0.0.0") {
+        throw new ExportError(`${name}: extraPorts bind must be 127.0.0.1 or 0.0.0.0`);
+      }
       lines.push(`      - ${q(`${bind}:${hostPort}:${port}/${protocol}`)}`);
     }
   }
