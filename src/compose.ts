@@ -482,6 +482,12 @@ function serviceLines(
         throw new ExportError(`${name}: secret "${secName}" needs a source file path`);
       }
       const hostSource = hostPath(outDir, resolveFrom(resource.path, f.source));
+      const existingSec = secrets.get(secName);
+      if (existingSec && existingSec !== hostSource) {
+        throw new ExportError(
+          `${name}: secret "${secName}" is defined with conflicting sources: "${existingSec}" and "${hostSource}"`,
+        );
+      }
       secrets.set(secName, hostSource);
 
       const target = typeof f.target === "string" ? f.target : undefined;
@@ -504,9 +510,7 @@ function serviceLines(
     }
   }
 
-  const configFiles = Array.isArray(c.configs)
-    ? (c.configs as unknown[]).map(record)
-    : [];
+  const configFiles = Array.isArray(c.configs) ? (c.configs as unknown[]).map(record) : [];
   if (configFiles.length > 0) {
     lines.push("    configs:");
     for (const f of configFiles) {
@@ -520,6 +524,12 @@ function serviceLines(
         throw new ExportError(`${name}: config "${cfgName}" needs a source file path`);
       }
       const hostSource = hostPath(outDir, resolveFrom(resource.path, f.source));
+      const existingCfg = configs.get(cfgName);
+      if (existingCfg && existingCfg !== hostSource) {
+        throw new ExportError(
+          `${name}: config "${cfgName}" is defined with conflicting sources: "${existingCfg}" and "${hostSource}"`,
+        );
+      }
       configs.set(cfgName, hostSource);
 
       const target = typeof f.target === "string" ? f.target : undefined;
@@ -725,7 +735,10 @@ export function buildCompose(
           "secrets:",
           ...[...secrets]
             .sort(([a], [b]) => a.localeCompare(b))
-            .flatMap(([s, hostSource]) => [`  ${s}:`, `    file: ${q(hostSource)}`]),
+            .flatMap(([s, hostSource]) => [
+              `  ${s}:`,
+              `    file: ${q(hostSource.replace(/\$/g, "$$$$"))}`,
+            ]),
           "",
         ]
       : []),
@@ -734,7 +747,10 @@ export function buildCompose(
           "configs:",
           ...[...configs]
             .sort(([a], [b]) => a.localeCompare(b))
-            .flatMap(([c, hostSource]) => [`  ${c}:`, `    file: ${q(hostSource)}`]),
+            .flatMap(([c, hostSource]) => [
+              `  ${c}:`,
+              `    file: ${q(hostSource.replace(/\$/g, "$$$$"))}`,
+            ]),
           "",
         ]
       : []),
