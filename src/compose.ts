@@ -47,6 +47,7 @@ const CPUS = /^[0-9]+(\.[0-9]{1,2})?$/;
 const MEMORY = /^[0-9]+([bBkKmMgG][bB]?)?$/;
 const PROFILE = /^[a-z0-9][a-z0-9-]*$/;
 const DOCKER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+const RESOURCE_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 
 export function isComposeExportable(resource: Resource): boolean {
   return resource.type === COMPOSE_TYPE && typeof resource.config.command !== "string";
@@ -70,6 +71,19 @@ function q(value: string): string {
   return JSON.stringify(value);
 }
 
+function formatMode(mode: unknown): string {
+  if (typeof mode === "number") {
+    return `0${mode.toString(8)}`;
+  }
+  if (typeof mode === "string") {
+    if (/^[0-7]{3,4}$/.test(mode)) {
+      return mode.startsWith("0") ? mode : `0${mode}`;
+    }
+    return q(mode);
+  }
+  throw new ExportError(`invalid mode: ${JSON.stringify(mode)}`);
+}
+
 function relPath(from: string, to: string): string {
   const rel = relative(from, to).split(sep).join("/");
   return rel === "" ? "." : rel;
@@ -90,6 +104,8 @@ interface Built {
   /** Named volumes, with the Docker name service.json gives each one (or undefined). */
   namedVolumes: Map<string, string | undefined>;
   models: Map<string, string>;
+  secrets: Map<string, string>;
+  configs: Map<string, string>;
 }
 
 function serviceLines(
@@ -108,6 +124,8 @@ function serviceLines(
   const lines: string[] = [`  ${name}:`];
   const namedVolumes = new Map<string, string | undefined>();
   const models = new Map<string, string>();
+  const secrets = new Map<string, string>();
+  const configs = new Map<string, string>();
 
   const image = typeof c.image === "string" && c.image ? c.image : undefined;
   const dockerfile = typeof c.dockerfile === "string" && c.dockerfile ? c.dockerfile : undefined;
@@ -448,7 +466,93 @@ function serviceLines(
     }
     lines.push("    profiles:", ...profiles.map((p) => `      - ${q(p)}`));
   }
-  return { lines, namedVolumes, models };
+  const secretFiles = Array.isArray(record(c.secrets).files)
+    ? (record(c.secrets).files as unknown[]).map(record)
+    : [];
+  if (secretFiles.length > 0) {
+    lines.push("    secrets:");
+    for (const f of secretFiles) {
+      const secName = typeof f.name === "string" ? f.name : "";
+      if (!RESOURCE_NAME.test(secName)) {
+        throw new ExportError(
+          `${name}: secret needs a name of letters, digits, dashes, dots and underscores`,
+        );
+      }
+      if (typeof f.source !== "string" || !f.source) {
+        throw new ExportError(`${name}: secret "${secName}" needs a source file path`);
+      }
+      const hostSource = hostPath(outDir, resolveFrom(resource.path, f.source));
+      const existingSec = secrets.get(secName);
+      if (existingSec && existingSec !== hostSource) {
+        throw new ExportError(
+          `${name}: secret "${secName}" is defined with conflicting sources: "${existingSec}" and "${hostSource}"`,
+        );
+      }
+      secrets.set(secName, hostSource);
+
+      const target = typeof f.target === "string" ? f.target : undefined;
+      const uid = f.uid !== undefined ? String(f.uid) : undefined;
+      const gid = f.gid !== undefined ? String(f.gid) : undefined;
+      const mode = f.mode !== undefined ? formatMode(f.mode) : undefined;
+
+      const isShort = (!target || target === `/run/secrets/${secName}`) && !uid && !gid && !mode;
+      if (isShort) {
+        lines.push(`      - ${q(secName)}`);
+      } else {
+        lines.push(
+          `      - source: ${q(secName)}`,
+          ...(target ? [`        target: ${q(target)}`] : []),
+          ...(uid !== undefined ? [`        uid: ${q(uid)}`] : []),
+          ...(gid !== undefined ? [`        gid: ${q(gid)}`] : []),
+          ...(mode !== undefined ? [`        mode: ${mode}`] : []),
+        );
+      }
+    }
+  }
+
+  const configFiles = Array.isArray(c.configs) ? (c.configs as unknown[]).map(record) : [];
+  if (configFiles.length > 0) {
+    lines.push("    configs:");
+    for (const f of configFiles) {
+      const cfgName = typeof f.name === "string" ? f.name : "";
+      if (!RESOURCE_NAME.test(cfgName)) {
+        throw new ExportError(
+          `${name}: config needs a name of letters, digits, dashes, dots and underscores`,
+        );
+      }
+      if (typeof f.source !== "string" || !f.source) {
+        throw new ExportError(`${name}: config "${cfgName}" needs a source file path`);
+      }
+      const hostSource = hostPath(outDir, resolveFrom(resource.path, f.source));
+      const existingCfg = configs.get(cfgName);
+      if (existingCfg && existingCfg !== hostSource) {
+        throw new ExportError(
+          `${name}: config "${cfgName}" is defined with conflicting sources: "${existingCfg}" and "${hostSource}"`,
+        );
+      }
+      configs.set(cfgName, hostSource);
+
+      const target = typeof f.target === "string" ? f.target : undefined;
+      const uid = f.uid !== undefined ? String(f.uid) : undefined;
+      const gid = f.gid !== undefined ? String(f.gid) : undefined;
+      const mode = f.mode !== undefined ? formatMode(f.mode) : undefined;
+
+      const isShort = (!target || target === `/${cfgName}`) && !uid && !gid && !mode;
+      if (isShort) {
+        lines.push(`      - ${q(cfgName)}`);
+      } else {
+        lines.push(
+          `      - source: ${q(cfgName)}`,
+          ...(target ? [`        target: ${q(target)}`] : []),
+          ...(uid !== undefined ? [`        uid: ${q(uid)}`] : []),
+          ...(gid !== undefined ? [`        gid: ${q(gid)}`] : []),
+          ...(mode !== undefined ? [`        mode: ${mode}`] : []),
+        );
+      }
+    }
+  }
+
+  return { lines, namedVolumes, models, secrets, configs };
 }
 
 /** What Compose waits for before starting a dependent: a passing check, a finished one-shot job, or the start. */
@@ -558,6 +662,8 @@ export function buildCompose(
   const body: string[] = [];
   const volumes = new Map<string, string | undefined>();
   const models = new Map<string, string>();
+  const secrets = new Map<string, string>();
+  const configs = new Map<string, string>();
   for (const service of services) {
     const built = serviceLines(service, outDir, known);
     body.push(...built.lines, "");
@@ -569,6 +675,24 @@ export function buildCompose(
       volumes.set(v, dockerName ?? known);
     }
     for (const [n, m] of built.models) models.set(n, m);
+    for (const [s, hostSource] of built.secrets) {
+      const known = secrets.get(s);
+      if (known && known !== hostSource) {
+        throw new ExportError(
+          `secret "${s}" is defined with conflicting sources: "${known}" and "${hostSource}"`,
+        );
+      }
+      secrets.set(s, hostSource);
+    }
+    for (const [c, hostSource] of built.configs) {
+      const known = configs.get(c);
+      if (known && known !== hostSource) {
+        throw new ExportError(
+          `config "${c}" is defined with conflicting sources: "${known}" and "${hostSource}"`,
+        );
+      }
+      configs.set(c, hostSource);
+    }
   }
   const header = [
     "###############################################################################",
@@ -603,6 +727,30 @@ export function buildCompose(
             .flatMap(([v, dockerName]) =>
               dockerName ? [`  ${v}:`, `    name: ${q(dockerName)}`] : [`  ${v}:`],
             ),
+          "",
+        ]
+      : []),
+    ...(secrets.size > 0
+      ? [
+          "secrets:",
+          ...[...secrets]
+            .sort(([a], [b]) => a.localeCompare(b))
+            .flatMap(([s, hostSource]) => [
+              `  ${s}:`,
+              `    file: ${q(hostSource.replace(/\$/g, "$$$$"))}`,
+            ]),
+          "",
+        ]
+      : []),
+    ...(configs.size > 0
+      ? [
+          "configs:",
+          ...[...configs]
+            .sort(([a], [b]) => a.localeCompare(b))
+            .flatMap(([c, hostSource]) => [
+              `  ${c}:`,
+              `    file: ${q(hostSource.replace(/\$/g, "$$$$"))}`,
+            ]),
           "",
         ]
       : []),
