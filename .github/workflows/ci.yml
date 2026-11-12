@@ -13,8 +13,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install
-      - run: npm run typecheck
-      - run: npm run lint
-      - run: npm run build
-      - run: npm run test
+      - uses: oven-sh/setup-bun@v2
+      # Installs exactly what bun.lock pins and fails when package.json and bun.lock disagree.
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run lint
+      - run: bun run build
+      - run: bun run test
