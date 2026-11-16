@@ -20,7 +20,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Publish only when every check on the tagged commit is green.
+  release-gate:
+    uses: flisk-sh/.github/.github/workflows/release-gate.yml@b5eeea945364038cd2143e9676b77fc9af293dfa # v1.4.0
+    permissions:
+      contents: read
+      checks: read
+
   publish:
+    needs: release-gate
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
