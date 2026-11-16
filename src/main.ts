@@ -46,6 +46,11 @@ function emit(io: Io, filePath: string, content: string, options: EmitOptions): 
     return;
   }
   if (existsSync(filePath) && !options.force) {
+    // A file that already holds exactly this content is not hand-edited: a re-run on an unchanged project is a no-op.
+    if (readFileSync(filePath, "utf-8") === content) {
+      io.out(`${shown} is already up to date.\n${NOTHING_DEPLOYED}\n`);
+      return;
+    }
     throw new ExportError(`${shown} already exists and was left unchanged`, [
       "Pass --force to replace it",
       "Pass --dry-run to see what would be written",

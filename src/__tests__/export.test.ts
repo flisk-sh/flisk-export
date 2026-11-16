@@ -194,6 +194,17 @@ describe("flisk-export render", () => {
     expect(fs.readFileSync(file, "utf-8")).toContain("services:");
   });
 
+  it("leaves an identical render.yaml alone and exits 0 on a re-run", async () => {
+    const root = exportProject();
+    expect((await run(["render"], root)).status).toBe(0);
+    const file = path.join(root, "render.yaml");
+    const written = fs.readFileSync(file, "utf-8");
+    const again = await run(["render"], root);
+    expect(again.status).toBe(0);
+    expect(again.stdout).toContain("already up to date");
+    expect(fs.readFileSync(file, "utf-8")).toBe(written);
+  });
+
   it("refuses a resource that does not serve HTTP", async () => {
     const root = exportProject();
     const result = await run(["render", "--resource", "shared"], root);
@@ -293,6 +304,17 @@ describe("flisk-export wrangler", () => {
     expect(fs.readFileSync(file, "utf-8")).toBe("# mine\n");
     expect((await run(["wrangler", "--resource", "edge", "--force"], root)).status).toBe(0);
     expect(fs.readFileSync(file, "utf-8")).toContain('name = "edge"');
+  });
+
+  it("leaves an identical wrangler.toml alone and exits 0 on a re-run", async () => {
+    const root = exportProject();
+    expect((await run(["wrangler", "--resource", "edge"], root)).status).toBe(0);
+    const file = path.join(root, "services/api/edge/wrangler.toml");
+    const written = fs.readFileSync(file, "utf-8");
+    const again = await run(["wrangler", "--resource", "edge"], root);
+    expect(again.status).toBe(0);
+    expect(again.stdout).toContain("already up to date");
+    expect(fs.readFileSync(file, "utf-8")).toBe(written);
   });
 
   it("rejects a --route that is a URL or a wildcard", async () => {
