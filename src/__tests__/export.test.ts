@@ -145,6 +145,52 @@ describe("flisk-export render", () => {
     expect(yaml).not.toContain(SECRET);
   });
 
+  it("renders an image-only resource as runtime: image with no build paths", async () => {
+    const root = exportProject();
+    writeFiles(root, {
+      "services/api/proxy/service.json": service({
+        appName: "proxy",
+        appType: "bring-your-own",
+        image: "nginx:1.27",
+        port: 8080,
+        healthCheckPath: "/healthz",
+      }),
+    });
+    const result = await run(["render", "--resource", "proxy", "--dry-run"], root);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(
+      [
+        '    name: "proxy"',
+        "    runtime: image",
+        "    image:",
+        '      url: "nginx:1.27"',
+        '    healthCheckPath: "/healthz"',
+        "    envVars:",
+        "      - key: PORT",
+        '        value: "8080"',
+      ].join("\n"),
+    );
+    expect(result.stdout).not.toContain("dockerfilePath");
+    expect(result.stdout).not.toContain("dockerContext");
+    expect(result.stdout).not.toContain("rootDir");
+    expect(result.stdout).not.toContain("buildCommand");
+  });
+
+  it("refuses an image reference that still has Compose variables", async () => {
+    const root = exportProject();
+    writeFiles(root, {
+      "services/api/db/service.json": service({
+        appName: "db",
+        appType: "bring-your-own",
+        image: "postgres:${VERSION:-18}",
+      }),
+    });
+    const result = await run(["render", "--resource", "db", "--dry-run"], root);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("variables");
+    expect(result.stderr).toContain("VERSION");
+  });
+
   it("writes paths relative to the git repository root when the project is in a subfolder", async () => {
     const repo = fs.mkdtempSync(path.join(os.tmpdir(), "flisk-export-repo-"));
     execFileSync("git", ["init", "-q"], { cwd: repo });
