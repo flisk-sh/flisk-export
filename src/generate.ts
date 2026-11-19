@@ -133,6 +133,27 @@ function dockerfileOf(resource: Resource): string | null {
   return existsSync(file) ? file : null;
 }
 
+/** The prebuilt image in service.json, when it names one as a string. */
+function imageOf(resource: Resource): string | undefined {
+  const image = resource.config.image;
+  return typeof image === "string" && image.trim() ? image : undefined;
+}
+
+/**
+ * A Blueprint has no shell or Compose interpolation, so an image with `${VAR}` cannot be pulled. Fail before writing
+ * a URL Render would reject, naming the image so the user can see which variable is still unresolved.
+ */
+function assertResolvableImage(resource: Resource, image: string): void {
+  if (!image.includes("${")) return;
+  throw new ExportError(
+    `Resource "${resource.name}" image ${quote(image)} still has Compose variables, which a Render Blueprint cannot resolve`,
+    [
+      "Set image in service.json to a literal image reference, such as nginx:1.27",
+      "Or export this resource after its image has been resolved to a fixed version",
+    ],
+  );
+}
+
 /** Whether a resource is exported: it must declare one of EXPORTABLE_TYPES. A resource with no type is not. */
 export function isExportable(resource: Resource): boolean {
   return resource.type !== undefined && EXPORTABLE_TYPES.includes(resource.type);
@@ -170,6 +191,7 @@ function renderService(repoRoot: string, resource: Resource): string[] {
   const lines = ["  - type: web", `    name: ${quote(deployName(resource.name))}`];
   const dockerfile = dockerfileOf(resource);
   const pkg = readPackageJson(resource.path);
+  const image = imageOf(resource);
   if (dockerfile) {
     lines.push(
       "    runtime: docker",
@@ -184,10 +206,16 @@ function renderService(repoRoot: string, resource: Resource): string[] {
       `    buildCommand: ${quote(hasBuild ? "npm install && npm run build" : "npm install")}`,
       `    startCommand: ${quote("npm start")}`,
     );
+  } else if (image !== undefined) {
+    assertResolvableImage(resource, image);
+    lines.push("    runtime: image", "    image:", `      url: ${quote(image)}`);
   } else {
     throw new ExportError(
-      `Resource "${resource.name}" has neither a Dockerfile nor a package.json, so Render has nothing to build`,
-      ["Add a Dockerfile to the resource directory, or set dockerfile in service.json"],
+      `Resource "${resource.name}" has neither a Dockerfile, a package.json nor an image, so Render has nothing to build`,
+      [
+        "Add a Dockerfile to the resource directory, or set dockerfile in service.json",
+        "Or set image in service.json to a prebuilt image reference for runtime: image",
+      ],
     );
   }
   const health = resource.config.healthCheckPath;
