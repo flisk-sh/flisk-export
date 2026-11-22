@@ -16,6 +16,8 @@ jobs:
           node-version: 22
       - name: Check CI hygiene
         run: node scripts/check-ci-hygiene.mjs
+      - name: Test CI hygiene check
+        run: node --test scripts/*.test.mjs
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       # Installs exactly what bun.lock pins and fails when package.json and bun.lock disagree.
       - run: bun install --frozen-lockfile

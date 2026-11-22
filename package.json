@@ -23,7 +23,8 @@
     "build": "tsc --project tsconfig.build.json && chmod +x dist/cli.js",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:scripts": "node --test scripts/*.test.mjs"
   },
   "dependencies": {
     "commander": "^15.0.0"
