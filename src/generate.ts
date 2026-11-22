@@ -99,6 +99,8 @@ function repoPath(repoRoot: string, absolute: string): string {
 
 interface PackageJson {
   main?: string;
+  packageManager?: string;
+  engines?: Record<string, unknown>;
   scripts: Record<string, unknown>;
   dependencies: Record<string, unknown>;
 }
@@ -122,6 +124,8 @@ function readPackageJson(dir: string): PackageJson | null {
   const pkg = parsed as Record<string, unknown>;
   return {
     main: typeof pkg.main === "string" && pkg.main ? pkg.main : undefined,
+    packageManager: typeof pkg.packageManager === "string" ? pkg.packageManager : undefined,
+    engines: record(pkg.engines),
     scripts: record(pkg.scripts),
     dependencies: { ...record(pkg.devDependencies), ...record(pkg.dependencies) },
   };
@@ -185,6 +189,33 @@ export function assertUniqueDeployNames(resources: readonly Resource[]): void {
   }
 }
 
+function detectBun(dir: string, pkg: PackageJson): string | null {
+  if (existsSync(join(dir, "bun.lock")) || existsSync(join(dir, "bun.lockb"))) {
+    return extractBunVersion(pkg) ?? "1.3";
+  }
+  if (pkg.packageManager?.startsWith("bun")) {
+    return extractBunVersion(pkg) ?? "1.3";
+  }
+  const startScript = typeof pkg.scripts.start === "string" ? pkg.scripts.start : "";
+  if (/^bun\b/.test(startScript.trim())) {
+    return extractBunVersion(pkg) ?? "1.3";
+  }
+  return null;
+}
+
+function extractBunVersion(pkg: PackageJson): string | null {
+  if (typeof pkg.packageManager === "string" && pkg.packageManager.startsWith("bun@")) {
+    const ver = pkg.packageManager.slice(4).trim();
+    if (ver) return ver;
+  }
+  const engineBun = pkg.engines?.bun;
+  if (typeof engineBun === "string") {
+    const cleaned = engineBun.replace(/^[^\d]*/, "").trim();
+    if (cleaned) return cleaned;
+  }
+  return null;
+}
+
 /** One service block of a Render Blueprint, indented for the `services:` list. */
 function renderService(repoRoot: string, resource: Resource): string[] {
   assertExportable(resource);
@@ -192,6 +223,8 @@ function renderService(repoRoot: string, resource: Resource): string[] {
   const dockerfile = dockerfileOf(resource);
   const pkg = readPackageJson(resource.path);
   const image = imageOf(resource);
+  let bunVersion: string | null = null;
+  let isStatic = false;
   if (dockerfile) {
     lines.push(
       "    runtime: docker",
@@ -200,12 +233,35 @@ function renderService(repoRoot: string, resource: Resource): string[] {
     );
   } else if (pkg) {
     const hasBuild = typeof pkg.scripts.build === "string";
-    lines.push(
-      "    runtime: node",
-      `    rootDir: ${quote(relPath(repoRoot, resource.path) || ".")}`,
-      `    buildCommand: ${quote(hasBuild ? "npm install && npm run build" : "npm install")}`,
-      `    startCommand: ${quote("npm start")}`,
-    );
+    const hasStart = typeof pkg.scripts.start === "string";
+    if (resource.type === "frontend" && !hasStart) {
+      isStatic = true;
+      lines.push(
+        "    runtime: static",
+        `    rootDir: ${quote(relPath(repoRoot, resource.path) || ".")}`,
+        `    buildCommand: ${quote(hasBuild ? "npm install && npm run build" : "npm install")}`,
+        `    staticPublishPath: ${quote("dist")}`,
+      );
+    } else if (!hasStart) {
+      throw new ExportError(`Resource "${resource.name}" has no start script`, [
+        "Add a start script to package.json, add a Dockerfile to the resource directory, or export one resource with --resource",
+      ]);
+    } else {
+      bunVersion = detectBun(resource.path, pkg);
+      const buildCmd = bunVersion
+        ? hasBuild
+          ? "bun install && bun run build"
+          : "bun install"
+        : hasBuild
+          ? "npm install && npm run build"
+          : "npm install";
+      lines.push(
+        "    runtime: node",
+        `    rootDir: ${quote(relPath(repoRoot, resource.path) || ".")}`,
+        `    buildCommand: ${quote(buildCmd)}`,
+        `    startCommand: ${quote(bunVersion ? "bun run start" : "npm start")}`,
+      );
+    }
   } else if (image !== undefined) {
     assertResolvableImage(resource, image);
     lines.push("    runtime: image", "    image:", `      url: ${quote(image)}`);
@@ -218,15 +274,22 @@ function renderService(repoRoot: string, resource: Resource): string[] {
       ],
     );
   }
-  const health = resource.config.healthCheckPath;
-  lines.push(
-    `    healthCheckPath: ${quote(typeof health === "string" && health ? health : DEFAULT_HEALTH_CHECK_PATH)}`,
-  );
-  const port = servicePort(resource);
+  if (!isStatic) {
+    const health = resource.config.healthCheckPath;
+    lines.push(
+      `    healthCheckPath: ${quote(typeof health === "string" && health ? health : DEFAULT_HEALTH_CHECK_PATH)}`,
+    );
+  }
+  const port = isStatic ? undefined : servicePort(resource);
   // Render routes traffic to $PORT (10000 by default), so a service listening on its own port needs PORT set.
-  const names = envVarNames(resource).filter((name) => port === undefined || name !== "PORT");
-  if (port !== undefined || names.length > 0) {
+  const names = envVarNames(resource).filter(
+    (name) => (port === undefined || name !== "PORT") && (!bunVersion || name !== "BUN_VERSION"),
+  );
+  const hasEnvVars = port !== undefined || bunVersion !== null || names.length > 0;
+  if (hasEnvVars) {
     lines.push("    envVars:");
+    if (bunVersion !== null)
+      lines.push("      - key: BUN_VERSION", `        value: ${quote(bunVersion)}`);
     if (port !== undefined)
       lines.push("      - key: PORT", `        value: ${quote(String(port))}`);
     for (const name of names) lines.push(`      - key: ${name}`, "        sync: false");

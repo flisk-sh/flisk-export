@@ -16,7 +16,7 @@ Or, from a Flisk project: `flisk export render --dry-run`.
 ### render
 
 - Exports every resource whose `appType` is `backend`, `frontend`, `agent`, `mcp` or `bring-your-own` (a resource with no `appType` is not exported), or one with `--resource`.
-- A resource with a Dockerfile becomes `runtime: docker`; one with a `package.json` becomes `runtime: node`; an image-only resource (the usual result of `flisk-import`) becomes `runtime: image` with `image.url` set to its literal `service.json` `image`. Image references with Compose variables such as `${VERSION}` are refused because a Blueprint cannot resolve them.
+- A resource with a Dockerfile becomes `runtime: docker`; one with a `package.json` becomes `runtime: node`; an image-only resource (the usual result of `flisk-import`) becomes `runtime: image` with `image.url` set to its literal `service.json` `image`. Image references with Compose variables such as `${VERSION}` are refused because a Blueprint cannot resolve them. Services whose `start` script runs Bun, or with a `bun.lock` or Bun in `packageManager`, export with `bun install` / `bun run` and a `BUN_VERSION` env var.
 - The `service.json` `port` is written as `PORT`, because Render routes traffic to `$PORT`.
 - Every other env name is written with `sync: false`, so Render asks for the value. Names that are not valid variable names are left out with a warning.
 - `healthCheckPath` comes from `service.json` (default `/health`).

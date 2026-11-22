@@ -637,6 +637,12 @@ export function composeProjectNames(projectRoot: string): Record<string, string>
   }
 }
 
+function hasContainerImageOrDockerfile(resource: Resource): boolean {
+  if (typeof resource.config.image === "string" && resource.config.image) return true;
+  if (typeof resource.config.dockerfile === "string" && resource.config.dockerfile) return true;
+  return existsSync(join(resource.path, "Dockerfile"));
+}
+
 /** The text of a docker-compose.yml for `resources`, written for a file in `outDir`. */
 export function buildCompose(
   outDir: string,
@@ -645,9 +651,17 @@ export function buildCompose(
 ): string {
   const services = resources.filter(isComposeExportable);
   if (services.length === 0) {
-    throw new ExportError("No bring-your-own resource was found to export", [
-      `Exported type: ${COMPOSE_TYPE} (a service.json with an image or a Dockerfile, and no command)`,
-    ]);
+    const hints = [
+      `Exported type: "appType": "${COMPOSE_TYPE}" (with an image or a Dockerfile, and no command)`,
+    ];
+    for (const resource of resources) {
+      if (resource.type !== COMPOSE_TYPE && hasContainerImageOrDockerfile(resource)) {
+        hints.push(
+          `- ${resource.name}: appType is "${resource.type ?? "undefined"}", not "${COMPOSE_TYPE}"`,
+        );
+      }
+    }
+    throw new ExportError("No bring-your-own resource was found to export", hints);
   }
   const known = new Map(services.map((s) => [s.name, s] as const));
   const stacks = new Set(

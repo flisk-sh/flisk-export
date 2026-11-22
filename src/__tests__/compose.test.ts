@@ -546,6 +546,26 @@ describe("buildCompose", () => {
     );
   });
 
+  it("names appType and lists skipped resources in empty export error hint", () => {
+    const web = res(
+      { appName: "web", appType: "frontend", dockerfile: "Dockerfile" },
+      "/p/services/web",
+    );
+    try {
+      buildCompose("/p", [web]);
+      expect.unreachable("expected buildCompose to throw");
+    } catch (error) {
+      expect(error).toBeInstanceOf(Error);
+      const err = error as { message: string; hints?: string[] };
+      expect(err.message).toBe("No bring-your-own resource was found to export");
+      expect(err.hints).toBeDefined();
+      expect(err.hints).toContain(
+        'Exported type: "appType": "bring-your-own" (with an image or a Dockerfile, and no command)',
+      );
+      expect(err.hints).toContain('- web: appType is "frontend", not "bring-your-own"');
+    }
+  });
+
   it("skips native command services", () => {
     expect(() => buildCompose("/p", [res({ appName: "n", command: "node x.js" })])).toThrow(
       /No bring-your-own/,
