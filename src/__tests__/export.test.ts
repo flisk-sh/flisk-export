@@ -39,7 +39,9 @@ function exportProject(root = fs.mkdtempSync(path.join(os.tmpdir(), "flisk-expor
       port: 4801,
       env: { OPENAI_API_KEY: SECRET },
     }),
-    "services/api/helper/package.json": JSON.stringify({ scripts: { build: "tsc" } }),
+    "services/api/helper/package.json": JSON.stringify({
+      scripts: { build: "tsc", start: "node dist/index.js" },
+    }),
     "services/api/edge/service.json": service({
       appName: "edge",
       appType: "mcp",
@@ -47,6 +49,7 @@ function exportProject(root = fs.mkdtempSync(path.join(os.tmpdir(), "flisk-expor
     }),
     "services/api/edge/package.json": JSON.stringify({
       main: "./src/worker.ts",
+      scripts: { start: "node src/worker.ts" },
       devDependencies: { wrangler: "^4.0.0" },
     }),
     "services/api/edge/src/worker.ts": "export default {};\n",
@@ -257,6 +260,128 @@ describe("flisk-export render", () => {
     expect(result.stderr).toContain("MY-KEY");
     expect(result.stdout).toContain("- key: GOOD");
     expect(result.stdout + result.stderr).not.toContain(SECRET);
+  });
+
+  it("exports a frontend with a build script and no start script as a Render static site", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "flisk-export-fe-"));
+    writeFiles(root, {
+      ".flisk/project.json": "{}",
+      "services/main/api/service.json": service({
+        appName: "api",
+        appType: "backend",
+        port: 3000,
+      }),
+      "services/main/api/package.json": JSON.stringify({
+        scripts: { build: "tsc", start: "node dist/index.js" },
+      }),
+      "services/main/web/service.json": service({
+        appName: "web",
+        appType: "frontend",
+        port: 3001,
+      }),
+      "services/main/web/package.json": JSON.stringify({
+        scripts: { dev: "vite", build: "vite build", preview: "vite preview" },
+      }),
+    });
+
+    const result = await run(["render", "--dry-run"], root);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(
+      [
+        "services:",
+        "  - type: web",
+        '    name: "api"',
+        "    runtime: node",
+        '    rootDir: "services/main/api"',
+        '    buildCommand: "npm install && npm run build"',
+        '    startCommand: "npm start"',
+        '    healthCheckPath: "/health"',
+        "    envVars:",
+        "      - key: PORT",
+        '        value: "3000"',
+        "  - type: web",
+        '    name: "web"',
+        "    runtime: static",
+        '    rootDir: "services/main/web"',
+        '    buildCommand: "npm install && npm run build"',
+        '    staticPublishPath: "dist"',
+      ].join("\n"),
+    );
+
+    const webBlock = result.stdout.split('name: "web"')[1] ?? "";
+    expect(webBlock).not.toContain("startCommand");
+    expect(webBlock).not.toContain("healthCheckPath");
+    expect(webBlock).not.toContain("PORT");
+  });
+
+  it("reads Vite build.outDir for staticPublishPath and keeps non-PORT env vars on static sites", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "flisk-export-vite-"));
+    writeFiles(root, {
+      ".flisk/project.json": "{}",
+      "services/main/web/service.json": service({
+        appName: "web",
+        appType: "frontend",
+        port: 3001,
+        env: { VITE_API_URL: SECRET },
+      }),
+      "services/main/web/package.json": JSON.stringify({
+        scripts: { build: "vite build" },
+      }),
+      "services/main/web/vite.config.ts":
+        'export default defineConfig({ build: { outDir: "build" } });\n',
+    });
+
+    const result = await run(["render", "--dry-run"], root);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("runtime: static");
+    expect(result.stdout).toContain('staticPublishPath: "build"');
+    expect(result.stdout).toContain("- key: VITE_API_URL");
+    expect(result.stdout).not.toContain("key: PORT");
+    expect(result.stdout).not.toContain("healthCheckPath");
+    expect(result.stdout + result.stderr).not.toContain(SECRET);
+  });
+
+  it("refuses a backend resource with package.json and no start script", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "flisk-export-nostart-"));
+    writeFiles(root, {
+      ".flisk/project.json": "{}",
+      "services/main/api/service.json": service({
+        appName: "api",
+        appType: "backend",
+        port: 3000,
+      }),
+      "services/main/api/package.json": JSON.stringify({
+        scripts: { build: "tsc" },
+      }),
+    });
+
+    const result = await run(["render", "--dry-run"], root);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('"api"');
+    expect(result.stderr).toContain('"start"');
+    expect(result.stderr).toContain("Dockerfile");
+    expect(result.stderr).toContain("--resource");
+  });
+
+  it("does not add a default /health check to a frontend that runs a server", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "flisk-export-fe-srv-"));
+    writeFiles(root, {
+      ".flisk/project.json": "{}",
+      "services/main/web/service.json": service({
+        appName: "web",
+        appType: "frontend",
+        port: 3001,
+      }),
+      "services/main/web/package.json": JSON.stringify({
+        scripts: { build: "next build", start: "next start" },
+      }),
+    });
+
+    const result = await run(["render", "--dry-run"], root);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("runtime: node");
+    expect(result.stdout).toContain('startCommand: "npm start"');
+    expect(result.stdout).not.toContain("healthCheckPath");
   });
 });
 

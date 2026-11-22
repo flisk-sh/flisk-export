@@ -16,10 +16,10 @@ Or, from a Flisk project: `flisk export render --dry-run`.
 ### render
 
 - Exports every resource whose `appType` is `backend`, `frontend`, `agent`, `mcp` or `bring-your-own` (a resource with no `appType` is not exported), or one with `--resource`.
-- A resource with a Dockerfile becomes `runtime: docker`; one with a `package.json` becomes `runtime: node`.
-- The `service.json` `port` is written as `PORT`, because Render routes traffic to `$PORT`.
+- A resource with a Dockerfile becomes `runtime: docker`; one with a `package.json` `start` script becomes `runtime: node`; a `frontend` with a `build` script and no `start` script becomes a static site (`runtime: static`, `staticPublishPath` from Vite's `build.outDir` or `dist`). A `package.json` resource with no `start` script (and not a static frontend) is refused.
+- The `service.json` `port` is written as `PORT` on server services, because Render routes traffic to `$PORT`.
 - Every other env name is written with `sync: false`, so Render asks for the value. Names that are not valid variable names are left out with a warning.
-- `healthCheckPath` comes from `service.json` (default `/health`).
+- `healthCheckPath` comes from `service.json` (default `/health` for non-frontend server services; static sites and frontends do not get a default `/health`).
 - Paths are relative to the **git repository root**, which is where Render reads them, and the file is written there by default. `--out` moves the file but not the paths.
 - Two resources that become the same service name (`api_v1` and `api-v1`) are refused.
 - Running it again when `render.yaml` already holds what it would write prints `already up to date` and exits 0 without touching the file; a file that differs is refused (exit 1) unless `--force`.

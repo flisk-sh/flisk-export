@@ -23,6 +23,16 @@ export const EXPORTABLE_TYPES: readonly string[] = [
 /** Health check path a service gets when service.json sets none (the same default the Flisk healthcheck uses). */
 export const DEFAULT_HEALTH_CHECK_PATH = "/health";
 
+/** Default publish directory for a Render static site when Vite's build.outDir is not set. */
+export const DEFAULT_STATIC_PUBLISH_PATH = "dist";
+
+const VITE_CONFIG_FILES: readonly string[] = [
+  "vite.config.ts",
+  "vite.config.mts",
+  "vite.config.js",
+  "vite.config.mjs",
+];
+
 /** Candidate Worker entry points, relative to the resource directory, tried in order when package.json has no main. */
 export const WORKER_ENTRY_CANDIDATES: readonly string[] = [
   "src/index.ts",
@@ -164,12 +174,30 @@ export function assertUniqueDeployNames(resources: readonly Resource[]): void {
   }
 }
 
+function staticPublishPath(dir: string): string {
+  for (const name of VITE_CONFIG_FILES) {
+    const file = join(dir, name);
+    if (!existsSync(file)) continue;
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    const match = /\bbuild\s*:\s*\{[^{}]*\boutDir\s*:\s*["']([^"']+)["']/.exec(content);
+    const outDir = match?.[1]?.trim().replace(/^\.\//, "");
+    if (outDir) return outDir;
+  }
+  return DEFAULT_STATIC_PUBLISH_PATH;
+}
+
 /** One service block of a Render Blueprint, indented for the `services:` list. */
 function renderService(repoRoot: string, resource: Resource): string[] {
   assertExportable(resource);
   const lines = ["  - type: web", `    name: ${quote(deployName(resource.name))}`];
   const dockerfile = dockerfileOf(resource);
   const pkg = readPackageJson(resource.path);
+  let isStatic = false;
   if (dockerfile) {
     lines.push(
       "    runtime: docker",
@@ -177,26 +205,56 @@ function renderService(repoRoot: string, resource: Resource): string[] {
       `    dockerContext: ${quote(repoPath(repoRoot, resource.path))}`,
     );
   } else if (pkg) {
-    const hasBuild = typeof pkg.scripts.build === "string";
-    lines.push(
-      "    runtime: node",
-      `    rootDir: ${quote(relPath(repoRoot, resource.path) || ".")}`,
-      `    buildCommand: ${quote(hasBuild ? "npm install && npm run build" : "npm install")}`,
-      `    startCommand: ${quote("npm start")}`,
-    );
+    const hasBuild = typeof pkg.scripts.build === "string" && pkg.scripts.build.trim().length > 0;
+    const hasStart = typeof pkg.scripts.start === "string" && pkg.scripts.start.trim().length > 0;
+    if (hasStart) {
+      lines.push(
+        "    runtime: node",
+        `    rootDir: ${quote(relPath(repoRoot, resource.path) || ".")}`,
+        `    buildCommand: ${quote(hasBuild ? "npm install && npm run build" : "npm install")}`,
+        `    startCommand: ${quote("npm start")}`,
+      );
+    } else if (resource.type === "frontend" && hasBuild) {
+      isStatic = true;
+      lines.push(
+        "    runtime: static",
+        `    rootDir: ${quote(relPath(repoRoot, resource.path) || ".")}`,
+        `    buildCommand: ${quote("npm install && npm run build")}`,
+        `    staticPublishPath: ${quote(staticPublishPath(resource.path))}`,
+      );
+    } else {
+      throw new ExportError(
+        `Resource "${resource.name}" has no "start" script in package.json, so Render cannot start it`,
+        [
+          'Add a "start" script to its package.json',
+          "Add a Dockerfile to the resource directory, or set dockerfile in service.json",
+          "Or export another resource with --resource <name>",
+        ],
+      );
+    }
   } else {
     throw new ExportError(
       `Resource "${resource.name}" has neither a Dockerfile nor a package.json, so Render has nothing to build`,
       ["Add a Dockerfile to the resource directory, or set dockerfile in service.json"],
     );
   }
-  const health = resource.config.healthCheckPath;
-  lines.push(
-    `    healthCheckPath: ${quote(typeof health === "string" && health ? health : DEFAULT_HEALTH_CHECK_PATH)}`,
-  );
-  const port = servicePort(resource);
+  if (!isStatic) {
+    const health = resource.config.healthCheckPath;
+    const healthPath =
+      typeof health === "string" && health
+        ? health
+        : resource.type === "frontend"
+          ? undefined
+          : DEFAULT_HEALTH_CHECK_PATH;
+    if (healthPath) {
+      lines.push(`    healthCheckPath: ${quote(healthPath)}`);
+    }
+  }
+  const port = isStatic ? undefined : servicePort(resource);
   // Render routes traffic to $PORT (10000 by default), so a service listening on its own port needs PORT set.
-  const names = envVarNames(resource).filter((name) => port === undefined || name !== "PORT");
+  const names = envVarNames(resource).filter((name) =>
+    isStatic ? name !== "PORT" : port === undefined || name !== "PORT",
+  );
   if (port !== undefined || names.length > 0) {
     lines.push("    envVars:");
     if (port !== undefined)
