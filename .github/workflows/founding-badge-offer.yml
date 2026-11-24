@@ -1,0 +1,30 @@
+name: Founding badge offer
+
+# When a community PR merges, invites its author to claim a numbered badge on Discord.
+# The comment and the job are shared by every public flisk-sh repo: the job is
+# flisk-sh/.github/.github/workflows/founding-badge-offer.yml and the wording is
+# flisk-sh/.github/messages/claim-badge.md. Edit those, not this file. This file only
+# decides when it runs. flisk-sh/flisk posts the same steps inside its own thank-you.
+#
+# pull_request_target runs from the base branch with a write token. The shared job never
+# checks out or runs PR code; it reads the PR only as data.
+
+on:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] never checks out or runs PR code; the shared job only reads event data and posts one comment
+    types: [closed]
+
+permissions: {}
+
+jobs:
+  offer:
+    name: Offer the numbered badge
+    # Skips the people the Discord bot refuses (scripts/discord-founding-role.mjs in flisk-sh/flisk).
+    # Private org members can arrive as CONTRIBUTOR, so they are named as well.
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.user.type == 'User' &&
+      !contains(fromJSON('["OWNER","MEMBER"]'), github.event.pull_request.author_association) &&
+      !contains(fromJSON('["kburym","odykyi","biomekonoko"]'), github.event.pull_request.user.login)
+    permissions:
+      pull-requests: write
+    uses: flisk-sh/.github/.github/workflows/founding-badge-offer.yml@main

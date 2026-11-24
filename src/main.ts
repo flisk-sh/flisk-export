@@ -1,0 +1,228 @@
+/**
+ * `flisk-export render|wrangler`: writes a deploy file from service.json and stops there. It never deploys, never
+ * creates DNS records and never calls a cloud API. The Flisk CLI runs it as `flisk export` at a pinned version.
+ */
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, relative, resolve } from "node:path";
+import { Command, CommanderError } from "commander";
+import { buildCompose, composeProjectNames } from "./compose.js";
+import {
+  discoverResources,
+  findProjectRoot,
+  findRepoRoot,
+  findResource,
+  type Resource,
+} from "./discover.js";
+import { ExportError } from "./errors.js";
+import {
+  assertExportable,
+  buildRenderBlueprint,
+  buildWranglerToml,
+  EXPORTABLE_TYPES,
+  isExportable,
+  skippedEnvNames,
+  skippedResourceAdvice,
+} from "./generate.js";
+
+export const NOTHING_DEPLOYED =
+  "Nothing was deployed, no DNS record was created and no cloud API was called.";
+
+export interface Io {
+  cwd: string;
+  out: (text: string) => void;
+  err: (text: string) => void;
+}
+
+interface EmitOptions {
+  out?: string;
+  dryRun?: boolean;
+  force?: boolean;
+}
+
+function emit(io: Io, filePath: string, content: string, options: EmitOptions): void {
+  const shown = relative(realDir(io.cwd), filePath) || filePath;
+  if (options.dryRun) {
+    io.out(`Dry run - would write ${shown} (nothing written, nothing deployed):\n\n`);
+    io.out(content);
+    return;
+  }
+  if (existsSync(filePath) && !options.force) {
+    // A file that already holds exactly this content is not hand-edited: a re-run on an unchanged project is a no-op.
+    if (readFileSync(filePath, "utf-8") === content) {
+      io.out(`${shown} is already up to date.\n${NOTHING_DEPLOYED}\n`);
+      return;
+    }
+    throw new ExportError(`${shown} already exists and was left unchanged`, [
+      "Pass --force to replace it",
+      "Pass --dry-run to see what would be written",
+      "Pass --out <dir> to write it somewhere else",
+    ]);
+  }
+  mkdirSync(dirname(filePath), { recursive: true });
+  writeFileSync(filePath, content, "utf-8");
+  io.out(`Wrote ${shown}.\n${NOTHING_DEPLOYED}\n`);
+}
+
+/** `dir` with its nearest existing ancestor resolved through links, so it compares with the resource paths. */
+function realDir(dir: string): string {
+  if (existsSync(dir)) return realpathSync(dir);
+  const parent = dirname(dir);
+  return parent === dir ? dir : join(realDir(parent), basename(dir));
+}
+
+function warnSkippedEnv(io: Io, resources: readonly Resource[]): void {
+  for (const resource of resources) {
+    const skipped = skippedEnvNames(resource);
+    if (skipped.length > 0) {
+      io.err(
+        `Warning: ${resource.name}: env names left out because they are not valid variable names: ${skipped.join(", ")}. Set them by hand on the platform.\n`,
+      );
+    }
+  }
+}
+
+/** One stderr line per discovered resource the export drops, saying what is still needed on the platform. */
+function warnSkippedResources(io: Io, resources: readonly Resource[]): void {
+  for (const resource of resources) {
+    io.err(
+      `Warning: skipped ${resource.name} (${resource.type ?? "no appType"}): ${skippedResourceAdvice(resource)}\n`,
+    );
+  }
+}
+
+function program(io: Io): Command {
+  const root = (dir?: string) => findProjectRoot(resolve(io.cwd, dir ?? "."));
+  const discover = (projectRoot: string) =>
+    discoverResources(projectRoot, (message) => io.err(`Warning: ${message}\n`));
+
+  const cli = new Command("flisk-export")
+    .description("Write deploy files (render.yaml, wrangler.toml) from service.json; never deploys")
+    .exitOverride()
+    .configureOutput({ writeOut: io.out, writeErr: io.err });
+
+  cli
+    .command("render")
+    .description("Write a Render Blueprint (render.yaml) from service.json; never deploys")
+    .argument("[dir]", "The Flisk project (default: the current directory)")
+    .option(
+      "--resource <name>",
+      "Export only this resource (default: every resource that serves HTTP)",
+    )
+    .option(
+      "--out <dir>",
+      "Directory to write render.yaml in (default: the git repository root). Paths inside are always relative to the git repository root, which is where Render reads them",
+    )
+    .option("--dry-run", "Print render.yaml instead of writing it", false)
+    .option("--force", "Replace an existing render.yaml", false)
+    .action((dir: string | undefined, options: EmitOptions & { resource?: string }) => {
+      const projectRoot = root(dir);
+      const repoRoot = findRepoRoot(projectRoot);
+      const all = discover(projectRoot);
+      let resources: Resource[];
+      if (options.resource) {
+        const resource = findResource(all, options.resource);
+        assertExportable(resource);
+        resources = [resource];
+      } else {
+        const skipped = all.filter((resource) => !isExportable(resource));
+        resources = all.filter(isExportable);
+        warnSkippedResources(io, skipped);
+        if (resources.length === 0) {
+          throw new ExportError("No resource that serves HTTP was found to export", [
+            `Exported types: ${EXPORTABLE_TYPES.join(", ")}`,
+          ]);
+        }
+      }
+      const content = buildRenderBlueprint(repoRoot, resources, all);
+      warnSkippedEnv(io, resources);
+      const outDir = options.out ? realDir(resolve(io.cwd, options.out)) : repoRoot;
+      emit(io, join(outDir, "render.yaml"), content, options);
+    });
+
+  cli
+    .command("compose")
+    .description(
+      "Write a standalone docker-compose.yml from bring-your-own service.json files; runs without Flisk, never deploys",
+    )
+    .argument("[dir]", "The Flisk project (default: the current directory)")
+    .option(
+      "--out <dir>",
+      "Directory to write docker-compose.yml in (default: <project>/.autogenerated)",
+    )
+    .option("--dry-run", "Print docker-compose.yml instead of writing it", false)
+    .option("--force", "Replace an existing docker-compose.yml", false)
+    .option("--check", "Exit 1 when the file on disk differs from what would be written", false)
+    .action((dir: string | undefined, options: EmitOptions & { check?: boolean }) => {
+      const projectRoot = root(dir);
+      const outDir = options.out
+        ? realDir(resolve(io.cwd, options.out))
+        : join(projectRoot, ".autogenerated");
+      const content = buildCompose(outDir, discover(projectRoot), {
+        composeProjectNames: composeProjectNames(projectRoot),
+      });
+      const file = join(outDir, "docker-compose.yml");
+      if (options.check) {
+        const shown = relative(realDir(io.cwd), file) || file;
+        if (!existsSync(file) || readFileSync(file, "utf-8") !== content) {
+          throw new ExportError(`${shown} is out of date`, [
+            "Run `flisk export compose --force` and commit the result",
+          ]);
+        }
+        io.out(`${shown} is up to date.\n`);
+        return;
+      }
+      emit(io, file, content, options);
+    });
+
+  cli
+    .command("wrangler")
+    .description(
+      "Write a Cloudflare wrangler.toml for one resource from service.json; never deploys",
+    )
+    .argument("[dir]", "The Flisk project (default: the current directory)")
+    .requiredOption("--resource <name>", "The resource to export")
+    .option("--route <host>", "Custom domain for the Worker (no wildcard; custom_domain = true)")
+    .option("--out <dir>", "Directory to write wrangler.toml in (default: the resource directory)")
+    .option("--allow-non-worker", "Export a resource that does not look like a Worker", false)
+    .option("--dry-run", "Print wrangler.toml instead of writing it", false)
+    .option("--force", "Replace an existing wrangler.toml", false)
+    .action(
+      (
+        dir: string | undefined,
+        options: EmitOptions & { resource: string; route?: string; allowNonWorker?: boolean },
+      ) => {
+        const resource = findResource(discover(root(dir)), options.resource);
+        const outDir = options.out ? realDir(resolve(io.cwd, options.out)) : resource.path;
+        const content = buildWranglerToml(resource, outDir, {
+          route: options.route,
+          allowNonWorker: options.allowNonWorker,
+        });
+        warnSkippedEnv(io, [resource]);
+        emit(io, join(outDir, "wrangler.toml"), content, options);
+      },
+    );
+
+  for (const sub of cli.commands) {
+    sub.exitOverride().configureOutput({ writeOut: io.out, writeErr: io.err });
+  }
+  return cli;
+}
+
+/** Runs the CLI with `args` (without node and the script) and resolves to the exit code. */
+export async function main(args: string[], io: Io): Promise<number> {
+  try {
+    await program(io).parseAsync(args, { from: "user" });
+    return 0;
+  } catch (error) {
+    if (error instanceof CommanderError) {
+      return error.exitCode === 0 ? 0 : error.exitCode || 1;
+    }
+    if (error instanceof ExportError) {
+      io.err(`Error: ${error.message}\n`);
+      for (const hint of error.hints) io.err(`-> ${hint}\n`);
+      return 1;
+    }
+    io.err(`Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+}
