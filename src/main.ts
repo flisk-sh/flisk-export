@@ -21,6 +21,7 @@ import {
   EXPORTABLE_TYPES,
   isExportable,
   skippedEnvNames,
+  skippedResourceAdvice,
 } from "./generate.js";
 
 export const NOTHING_DEPLOYED =
@@ -80,6 +81,15 @@ function warnSkippedEnv(io: Io, resources: readonly Resource[]): void {
   }
 }
 
+/** One stderr line per discovered resource the export drops, saying what is still needed on the platform. */
+function warnSkippedResources(io: Io, resources: readonly Resource[]): void {
+  for (const resource of resources) {
+    io.err(
+      `Warning: skipped ${resource.name} (${resource.type ?? "no appType"}): ${skippedResourceAdvice(resource)}\n`,
+    );
+  }
+}
+
 function program(io: Io): Command {
   const root = (dir?: string) => findProjectRoot(resolve(io.cwd, dir ?? "."));
   const discover = (projectRoot: string) =>
@@ -114,14 +124,16 @@ function program(io: Io): Command {
         assertExportable(resource);
         resources = [resource];
       } else {
+        const skipped = all.filter((resource) => !isExportable(resource));
         resources = all.filter(isExportable);
+        warnSkippedResources(io, skipped);
         if (resources.length === 0) {
           throw new ExportError("No resource that serves HTTP was found to export", [
             `Exported types: ${EXPORTABLE_TYPES.join(", ")}`,
           ]);
         }
       }
-      const content = buildRenderBlueprint(repoRoot, resources);
+      const content = buildRenderBlueprint(repoRoot, resources, all);
       warnSkippedEnv(io, resources);
       const outDir = options.out ? realDir(resolve(io.cwd, options.out)) : repoRoot;
       emit(io, join(outDir, "render.yaml"), content, options);

@@ -20,6 +20,26 @@ export const EXPORTABLE_TYPES: readonly string[] = [
   "bring-your-own",
 ];
 
+/**
+ * The appTypes that hold data and never serve HTTP, so they are left out of a Blueprint. A service that names one
+ * in dependsOn still reads its connection string from the environment, which is why the Blueprint lists
+ * DATABASE_URL for it.
+ */
+const DATA_RESOURCE_TYPES: readonly string[] = ["database", "migrator"];
+
+/**
+ * The dependsOn names that mean the shared platform Postgres even when the project declares no `database`
+ * resource, the same names the Flisk CLI accepts in shared-platform-postgres.ts.
+ */
+const SHARED_POSTGRES_NAMES: readonly string[] = ["postgres", "database-management"];
+
+/** The manual step a skipped appType needs on Render, when Render has a place for it at all. */
+const SKIPPED_TYPE_ADVICE: Record<string, string> = {
+  database: "add a Render Postgres (databases:) and set DATABASE_URL on the services that read it",
+  migrator: "run it as a preDeployCommand or a one-off job",
+  worker: "add it as a Render background worker (type: worker)",
+};
+
 /** Health check path a service gets when service.json sets none (the same default the Flisk healthcheck uses). */
 export const DEFAULT_HEALTH_CHECK_PATH = "/health";
 
@@ -71,6 +91,62 @@ export function skippedEnvNames(resource: Resource): string[] {
   return envKeys(resource)
     .filter((name) => !ENV_NAME.test(name))
     .sort();
+}
+
+/** The name of one dependsOn entry: the string itself, or `name` of a `{ name, condition }` object. */
+function dependsOnEntryName(entry: unknown): string | null {
+  if (typeof entry === "string") return entry;
+  if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+    const name = (entry as { name?: unknown }).name;
+    if (typeof name === "string" && name !== "") return name;
+  }
+  return null;
+}
+
+/** Every dependency name a service declares: `dependsOn`, plus the deprecated `dependencies` spelling. */
+export function dependsOnNames(config: Record<string, unknown>): string[] {
+  const names: string[] = [];
+  for (const key of ["dependsOn", "dependencies"] as const) {
+    const value = config[key];
+    if (!Array.isArray(value)) continue;
+    for (const entry of value) {
+      const name = dependsOnEntryName(entry);
+      if (name !== null) names.push(name);
+    }
+  }
+  return [...new Set(names)];
+}
+
+/** The names of the project's data resources, which a service can name in dependsOn. */
+function dataResourceNames(resources: readonly Resource[]): ReadonlySet<string> {
+  const names = new Set<string>();
+  for (const resource of resources) {
+    if (resource.type !== undefined && DATA_RESOURCE_TYPES.includes(resource.type)) {
+      names.add(resource.name);
+    }
+  }
+  return names;
+}
+
+/**
+ * True when the service names a data resource or the shared Postgres in dependsOn, which is when the Flisk runtime
+ * hands it DATABASE_URL. The Blueprint lists the name so Render asks for the value; nothing here derives a URL.
+ */
+function readsDatabaseUrl(resource: Resource, dataNames: ReadonlySet<string>): boolean {
+  return dependsOnNames(resource.config).some(
+    (name) => dataNames.has(name) || SHARED_POSTGRES_NAMES.includes(name),
+  );
+}
+
+/**
+ * What to tell the user about a resource the export leaves out: the step still needed on Render, or why there is
+ * none. A resource with no appType is told to set one first.
+ */
+export function skippedResourceAdvice(resource: Resource): string {
+  if (resource.type === undefined) {
+    return "set appType in its service.json; only resources that serve HTTP are exported";
+  }
+  return SKIPPED_TYPE_ADVICE[resource.type] ?? "it does not serve HTTP, so it is not exported";
 }
 
 /** The port service.json declares, or undefined. */
@@ -168,9 +244,15 @@ export function isExportable(resource: Resource): boolean {
 export function assertExportable(resource: Resource): void {
   if (isExportable(resource)) return;
   const what = resource.type ? `a ${resource.type}` : "a resource with no appType";
+  const hints = [`Exported types: ${EXPORTABLE_TYPES.join(", ")}`];
+  const advice =
+    resource.type === undefined
+      ? "Set appType in its service.json"
+      : SKIPPED_TYPE_ADVICE[resource.type];
+  if (advice !== undefined) hints.push(`${advice.charAt(0).toUpperCase()}${advice.slice(1)}`);
   throw new ExportError(
     `Resource "${resource.name}" is ${what}, which does not serve HTTP, so it is not exported`,
-    [`Exported types: ${EXPORTABLE_TYPES.join(", ")}`, "Set appType in its service.json"],
+    hints,
   );
 }
 
@@ -218,7 +300,11 @@ function extractBunVersion(pkg: PackageJson): string | null {
 }
 
 /** One service block of a Render Blueprint, indented for the `services:` list. */
-function renderService(repoRoot: string, resource: Resource): string[] {
+function renderService(
+  repoRoot: string,
+  resource: Resource,
+  dataNames: ReadonlySet<string>,
+): string[] {
   assertExportable(resource);
   const lines = ["  - type: web", `    name: ${quote(deployName(resource.name))}`];
   const docker = dockerBuildOf(resource);
@@ -286,6 +372,10 @@ function renderService(repoRoot: string, resource: Resource): string[] {
   const names = envVarNames(resource).filter(
     (name) => (port === undefined || name !== "PORT") && (!bunVersion || name !== "BUN_VERSION"),
   );
+  if (readsDatabaseUrl(resource, dataNames) && !names.includes("DATABASE_URL")) {
+    names.push("DATABASE_URL");
+    names.sort((a, b) => a.localeCompare(b));
+  }
   const hasEnvVars = port !== undefined || bunVersion !== null || names.length > 0;
   if (hasEnvVars) {
     lines.push("    envVars:");
@@ -300,17 +390,24 @@ function renderService(repoRoot: string, resource: Resource): string[] {
 
 /**
  * A Render Blueprint for the given resources. `repoRoot` is the git repository root, which Render reads every path
- * against. Every env var is listed by name with `sync: false`, never a value.
+ * against. Every env var is listed by name with `sync: false`, never a value. `catalog` is every discovered
+ * resource, exported or not, so a dependsOn on a database or migrator adds the DATABASE_URL name the service reads
+ * locally; it defaults to `resources` for callers that already filtered.
  */
-export function buildRenderBlueprint(repoRoot: string, resources: readonly Resource[]): string {
+export function buildRenderBlueprint(
+  repoRoot: string,
+  resources: readonly Resource[],
+  catalog: readonly Resource[] = resources,
+): string {
   assertUniqueDeployNames(resources);
+  const dataNames = dataResourceNames(catalog);
   const header = [
     "# Render Blueprint written by `flisk export render` from service.json. Nothing was deployed.",
     "# Review it, commit it at the root of the git repository, then on render.com: New -> Blueprint.",
     "# Render asks for every envVars value marked sync: false; no secret value is in this file.",
     "services:",
   ];
-  const blocks = resources.flatMap((resource) => renderService(repoRoot, resource));
+  const blocks = resources.flatMap((resource) => renderService(repoRoot, resource, dataNames));
   return `${[...header, ...blocks].join("\n")}\n`;
 }
 

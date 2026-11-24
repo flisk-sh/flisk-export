@@ -62,6 +62,42 @@ function exportProject(root = fs.mkdtempSync(path.join(os.tmpdir(), "flisk-expor
   return root;
 }
 
+/**
+ * The next-postgres shape from flisk#5371: a frontend and a backend that serves HTTP, plus the database and the
+ * migrator the API waits on, none of which a Render web service can be.
+ */
+function postgresProject(
+  root = fs.mkdtempSync(path.join(os.tmpdir(), "flisk-export-pg-")),
+): string {
+  writeFiles(root, {
+    ".flisk/project.json": "{}",
+    "services/app/web/service.json": service({ appName: "web", appType: "frontend" }),
+    "services/app/web/package.json": JSON.stringify({
+      scripts: { build: "vite build", start: "vite preview" },
+    }),
+    "services/app/api/service.json": service({
+      appName: "api",
+      appType: "backend",
+      port: 4000,
+      dependsOn: ["api-migrator"],
+    }),
+    "services/app/api/package.json": JSON.stringify({
+      scripts: { start: "node dist/index.js" },
+    }),
+    "services/app/api-migrator/service.json": service({
+      appName: "api-migrator",
+      appType: "migrator",
+      dependsOn: ["postgres"],
+    }),
+    "services/app/db/service.json": service({
+      appName: "db",
+      appType: "database",
+      framework: "postgres",
+    }),
+  });
+  return root;
+}
+
 interface Run {
   status: number;
   stdout: string;
@@ -485,6 +521,136 @@ describe("flisk-export render", () => {
     );
     expect(yaml).not.toContain("healthCheckPath");
     expect(yaml).not.toContain("PORT");
+  });
+
+  it("warns once per dropped database or migrator and lists DATABASE_URL for the service that waits on it", async () => {
+    const root = postgresProject();
+    const result = await run(["render"], root);
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain(
+      "skipped api-migrator (migrator): run it as a preDeployCommand or a one-off job",
+    );
+    expect(result.stderr).toContain(
+      "skipped db (database): add a Render Postgres (databases:) and set DATABASE_URL",
+    );
+    const yaml = fs.readFileSync(path.join(root, "render.yaml"), "utf-8");
+    expect(yaml).toContain("- key: DATABASE_URL\n        sync: false");
+    expect(yaml).not.toContain("api-migrator");
+    expect(yaml).not.toContain("databases:");
+    expect(yaml.match(/- key: DATABASE_URL/g)).toHaveLength(1);
+  });
+
+  it("keeps the skipped-resource warnings on stderr so dry-run stdout stays deploy YAML", async () => {
+    const root = postgresProject();
+    const result = await run(["render", "--dry-run"], root);
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain("skipped db (database)");
+    expect(result.stderr).toContain("skipped api-migrator (migrator)");
+    expect(result.stdout).not.toContain("skipped");
+    expect(result.stdout).toContain("- key: DATABASE_URL");
+  });
+
+  it("does not infer DATABASE_URL for a service that depends only on another service", async () => {
+    const root = postgresProject();
+    writeFiles(root, {
+      "services/app/calls-api/service.json": service({
+        appName: "calls-api",
+        appType: "backend",
+        dependsOn: ["api"],
+      }),
+      "services/app/calls-api/package.json": JSON.stringify({
+        scripts: { start: "node server.js" },
+      }),
+    });
+    const result = await run(["render"], root);
+    expect(result.status).toBe(0);
+    const yaml = fs.readFileSync(path.join(root, "render.yaml"), "utf-8");
+    expect(yaml.match(/- key: DATABASE_URL/g)).toHaveLength(1);
+  });
+
+  it("lists DATABASE_URL for the database resource name, the shared postgres alias and object dependsOn", async () => {
+    const root = postgresProject();
+    writeFiles(root, {
+      "services/app/direct/service.json": service({
+        appName: "direct",
+        appType: "backend",
+        dependsOn: ["db"],
+      }),
+      "services/app/direct/package.json": JSON.stringify({
+        scripts: { start: "node d.js" },
+      }),
+      "services/app/alias/service.json": service({
+        appName: "alias",
+        appType: "backend",
+        dependsOn: ["postgres"],
+      }),
+      "services/app/alias/package.json": JSON.stringify({
+        scripts: { start: "node a.js" },
+      }),
+      "services/app/healthy/service.json": service({
+        appName: "healthy",
+        appType: "backend",
+        dependsOn: [{ name: "db", condition: "service_healthy" }],
+      }),
+      "services/app/healthy/package.json": JSON.stringify({
+        scripts: { start: "node h.js" },
+      }),
+      "services/app/legacy/service.json": service({
+        appName: "legacy",
+        appType: "backend",
+        dependencies: ["db"],
+      }),
+      "services/app/legacy/package.json": JSON.stringify({
+        scripts: { start: "node l.js" },
+      }),
+    });
+    const result = await run(["render"], root);
+    expect(result.status).toBe(0);
+    const yaml = fs.readFileSync(path.join(root, "render.yaml"), "utf-8");
+    expect(yaml.match(/- key: DATABASE_URL/g)).toHaveLength(5);
+  });
+
+  it("does not list DATABASE_URL twice when service.json env already declares it", async () => {
+    const root = postgresProject();
+    writeFiles(root, {
+      "services/app/api/service.json": service({
+        appName: "api",
+        appType: "backend",
+        port: 4000,
+        dependsOn: ["api-migrator"],
+        env: { DATABASE_URL: "postgres://elsewhere/app" },
+      }),
+    });
+    const result = await run(["render"], root);
+    expect(result.status).toBe(0);
+    const yaml = fs.readFileSync(path.join(root, "render.yaml"), "utf-8");
+    expect(yaml.match(/- key: DATABASE_URL/g)).toHaveLength(1);
+    expect(yaml).not.toContain("postgres://elsewhere/app");
+  });
+
+  it("still lists DATABASE_URL under --resource, and --resource on a database names the manual step", async () => {
+    const root = postgresProject();
+    const one = await run(["render", "--resource", "api", "--dry-run"], root);
+    expect(one.status).toBe(0);
+    expect(one.stdout).toContain("- key: DATABASE_URL");
+    expect(one.stderr).not.toContain("skipped db");
+    const db = await run(["render", "--resource", "db"], root);
+    expect(db.status).toBe(1);
+    expect(db.stderr).toContain("does not serve HTTP");
+    expect(db.stderr).toContain("Render Postgres");
+  });
+
+  it("says why a library or an untyped resource is skipped too", async () => {
+    const root = exportProject();
+    writeFiles(root, {
+      "services/api/untyped/service.json": service({ appName: "untyped" }),
+      "services/api/untyped/Dockerfile": "FROM node:22\n",
+    });
+    const result = await run(["render", "--dry-run"], root);
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain("skipped shared (library): it does not serve HTTP");
+    expect(result.stderr).toContain("skipped untyped (no appType): set appType");
+    expect(result.stdout).not.toContain("skipped");
   });
 
   it("throws ExportError when non-frontend service has no start script", async () => {

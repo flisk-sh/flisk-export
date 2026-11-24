@@ -16,6 +16,7 @@ Or, from a Flisk project: `flisk export render --dry-run`.
 ### render
 
 - Exports every resource whose `appType` is `backend`, `frontend`, `agent`, `mcp` or `bring-your-own` (a resource with no `appType` is not exported), or one with `--resource`.
+- A resource that is not exported is not silent either: one `Warning: skipped <name> (<appType>):` line on stderr says what still needs doing on Render by hand, such as a `databases:` Postgres for a `database` resource or a `preDeployCommand` for a `migrator`. A service whose `dependsOn` (or the deprecated `dependencies`) names a `database` or `migrator` resource, or the shared `postgres`, gets a `DATABASE_URL` env var with `sync: false`, by name only, so Render asks for the value.
 - A resource with a Dockerfile becomes `runtime: docker`; one with a `package.json` becomes `runtime: node`; an image-only resource (the usual result of `flisk-import`) becomes `runtime: image` with `image.url` set to its literal `service.json` `image`. Image references with Compose variables such as `${VERSION}` are refused because a Blueprint cannot resolve them. Services whose `start` script runs Bun, or with a `bun.lock` or Bun in `packageManager`, export with `bun install` / `bun run` and a `BUN_VERSION` env var.
 - The `service.json` `port` is written as `PORT`, because Render routes traffic to `$PORT`.
 - Every other env name is written with `sync: false`, so Render asks for the value. Names that are not valid variable names are left out with a warning.
